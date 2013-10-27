@@ -240,8 +240,7 @@ static gboolean check_remaining_length(packet_info *pinfo, guint initial_offset,
 
 	if (need > have) {
 		pinfo->desegment_offset = initial_offset;
-		pinfo->desegment_len = need;
-		printf("### %d\n", need);
+		pinfo->desegment_len = need - have;
 		return FALSE;
 	}
 
@@ -254,8 +253,9 @@ static guint dissect_sane_rpc_request(packet_info *pinfo, proto_tree *sane_tree,
 	conversation_t *conversation = NULL;
 	proto_item *sane_sub_item = NULL;
 	proto_tree *sane_sub_tree = NULL;
-	GQueue *rpc_queue = NULL;
-	guint rpc = 0, *prpc = NULL;
+	GQueue *frame_rpc_queue = NULL;
+	guint *frame_rpc = NULL;
+	guint rpc = 0;
 	guint len = 0;
 
 	if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
@@ -401,20 +401,19 @@ static guint dissect_sane_rpc_request(packet_info *pinfo, proto_tree *sane_tree,
 	if (!pinfo->fd->flags.visited) {
 		conversation = find_or_create_conversation(pinfo);
 		if (conversation) {
-			rpc_queue = (GQueue*) conversation_get_proto_data(conversation, proto_sane);
-			if (!rpc_queue) {
-				rpc_queue = (GQueue*) se_alloc(sizeof(GQueue));
-				if (rpc_queue) {
-					g_queue_init(rpc_queue);
-					conversation_add_proto_data(conversation, proto_sane, rpc_queue);
+			frame_rpc_queue = (GQueue*) conversation_get_proto_data(conversation, proto_sane);
+			if (!frame_rpc_queue) {
+				frame_rpc_queue = (GQueue*) se_alloc(sizeof(GQueue));
+				if (frame_rpc_queue) {
+					g_queue_init(frame_rpc_queue);
+					conversation_add_proto_data(conversation, proto_sane, frame_rpc_queue);
 				}
 			}
-			if (rpc_queue) {
-				prpc = (guint*) se_alloc(sizeof(guint));
-				if (prpc) {
-					*prpc = rpc;
-					g_queue_push_tail(rpc_queue, prpc);
-					printf(">>> %s\n", val_to_str(rpc, CodeNames, "0x%08x"));
+			if (frame_rpc_queue) {
+				frame_rpc = (guint*) se_alloc(sizeof(guint));
+				if (frame_rpc) {
+					*frame_rpc = rpc;
+					g_queue_push_tail(frame_rpc_queue, frame_rpc);
 				}
 			}
 		}
@@ -427,31 +426,52 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 {
 	guint remember_initial_offset = offset;
 	conversation_t *conversation = NULL;
-	proto_item *sane_sub_item[2] = { NULL, NULL };
-	proto_tree *sane_sub_tree[2] = { NULL, NULL };
-	GQueue *rpc_queue = NULL;
-	guint rpc = 0, *prpc = NULL;
-	guint len = 0, idx[2], cnt[2];
+	proto_item *sane_subsub_item = NULL;
+	proto_tree *sane_subsub_tree = NULL;
+	proto_item *sane_sub_item = NULL;
+	proto_tree *sane_sub_tree = NULL;
+	GQueue *packet_rpc_queue = NULL;
+	GQueue *frame_rpc_queue = NULL;
+	guint *packet_rpc = NULL;
+	guint *frame_rpc = NULL;
+	guint sub_idx = 0;
+	guint sub_cnt = 0;
+	guint idx = 0;
+	guint cnt = 0;
+	guint rpc = 0;
+	guint len = 0;
 
-	prpc = (guint*) p_get_proto_data(pinfo->fd, proto_sane, 0);
-	if (!prpc) {
-		conversation = find_or_create_conversation(pinfo);
-		if (conversation) {
-			rpc_queue = (GQueue*) conversation_get_proto_data(conversation, proto_sane);
-			if (rpc_queue) {
-				prpc = (guint*) g_queue_peek_head(rpc_queue);
-				if (prpc) {
-					p_add_proto_data(pinfo->fd, proto_sane, 0, prpc);
-					printf("<<< %s\n", val_to_str(*prpc, CodeNames, "0x%08x"));
-				} else
-					printf("<<< ...?\n");
+	conversation = find_or_create_conversation(pinfo);
+	if (conversation) {
+		frame_rpc_queue = (GQueue*) conversation_get_proto_data(conversation, proto_sane);
+	}
+
+	packet_rpc_queue = (GQueue*) p_get_proto_data(pinfo->fd, proto_sane, 0);
+	if (!packet_rpc_queue) {
+		packet_rpc_queue = (GQueue*) se_alloc(sizeof(GQueue));
+		if (packet_rpc_queue) {
+			g_queue_init(packet_rpc_queue);
+			p_add_proto_data(pinfo->fd, proto_sane, 0, packet_rpc_queue);
+		}
+	}
+
+	if (packet_rpc_queue) {
+		packet_rpc = (guint*) g_queue_peek_head(packet_rpc_queue);
+		if (!packet_rpc) {
+			if (frame_rpc_queue) {
+				frame_rpc = (guint*) g_queue_peek_head(frame_rpc_queue);
+				if (frame_rpc) {
+					g_queue_push_tail(packet_rpc_queue, frame_rpc);
+					packet_rpc = frame_rpc;
+				}
 			}
 		}
 	}
-	if (!prpc)
+
+	if (!packet_rpc)
 		return offset;
 
-	rpc = *prpc;
+	rpc = *packet_rpc;
 
 	switch (rpc) {
 		case SANE_NET_INIT:
@@ -462,12 +482,12 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 				return offset;
 
 			if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
-				sane_sub_item[0] = proto_tree_add_item(sane_tree, hf_sane_net_version_code, tvb, offset, 4, ENC_BIG_ENDIAN);
-				if (sane_sub_item[0]) {
-					sane_sub_tree[0] = proto_item_add_subtree(sane_sub_item[0], ett_sane);
-					proto_tree_add_item(sane_sub_tree[0], hf_sane_net_version_code_major, tvb, offset + 0, 1, ENC_BIG_ENDIAN);
-					proto_tree_add_item(sane_sub_tree[0], hf_sane_net_version_code_minor, tvb, offset + 1, 1, ENC_BIG_ENDIAN);
-					proto_tree_add_item(sane_sub_tree[0], hf_sane_net_version_code_build, tvb, offset + 2, 2, ENC_BIG_ENDIAN);
+				sane_sub_item = proto_tree_add_item(sane_tree, hf_sane_net_version_code, tvb, offset, 4, ENC_BIG_ENDIAN);
+				if (sane_sub_item) {
+					sane_sub_tree = proto_item_add_subtree(sane_sub_item, ett_sane);
+					proto_tree_add_item(sane_sub_tree, hf_sane_net_version_code_major, tvb, offset + 0, 1, ENC_BIG_ENDIAN);
+					proto_tree_add_item(sane_sub_tree, hf_sane_net_version_code_minor, tvb, offset + 1, 1, ENC_BIG_ENDIAN);
+					proto_tree_add_item(sane_sub_tree, hf_sane_net_version_code_build, tvb, offset + 2, 2, ENC_BIG_ENDIAN);
 				}
 				offset += 4;
 			} else
@@ -482,12 +502,12 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 				return offset;
 
 			if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
-				cnt[0] = tvb_get_ntohl(tvb, offset);
+				cnt = tvb_get_ntohl(tvb, offset);
 				offset += 4;
 			} else
 				return offset;
 
-			for (idx[0] = 0; idx[0] < cnt[0]; idx[0]++) {
+			for (idx = 0; idx < cnt; idx++) {
 				if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
 					len = tvb_get_ntohl(tvb, offset);
 					offset += 4;
@@ -497,9 +517,12 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 				if (len) /* null-pointer check */
 					continue;
 
-				sane_sub_item[0] = proto_tree_add_item(sane_tree, hf_sane_net_device, tvb, offset, -1, ENC_BIG_ENDIAN);
+				if (!check_remaining_length(pinfo, remember_initial_offset, offset, length, 16))
+					return offset;
+
+				sane_sub_item = proto_tree_add_item(sane_tree, hf_sane_net_device, tvb, offset, -1, ENC_NA);
 				if (sane_sub_item) {
-					sane_sub_tree[0] = proto_item_add_subtree(sane_sub_item[0], ett_sane);
+					sane_sub_tree = proto_item_add_subtree(sane_sub_item, ett_sane);
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 16)) {
 						len = tvb_get_ntohl(tvb, offset);
@@ -508,7 +531,7 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_device_name, tvb, offset, len, ENC_UTF_8);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_device_name, tvb, offset, len, ENC_UTF_8);
 						offset += len;
 					} else
 						return offset;
@@ -520,7 +543,7 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_device_vendor, tvb, offset, len, ENC_UTF_8);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_device_vendor, tvb, offset, len, ENC_UTF_8);
 						offset += len;
 					} else
 						return offset;
@@ -532,7 +555,7 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_device_model, tvb, offset, len, ENC_UTF_8);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_device_model, tvb, offset, len, ENC_UTF_8);
 						offset += len;
 					} else
 						return offset;
@@ -544,12 +567,12 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_device_type, tvb, offset, len, ENC_UTF_8);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_device_type, tvb, offset, len, ENC_UTF_8);
 						offset += len;
 					} else
 						return offset;
 
-					proto_item_set_end(sane_sub_item[0], tvb, offset);
+					proto_item_set_end(sane_sub_item, tvb, offset);
 				}
 			}
 		break;
@@ -582,13 +605,13 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 
 		case SANE_NET_GET_OPTION_DESCRIPTORS:
 			if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
-				cnt[0] = tvb_get_ntohl(tvb, offset);
+				cnt = tvb_get_ntohl(tvb, offset);
 				proto_tree_add_item(sane_tree, hf_sane_net_num_options, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
 			} else
 				return offset;
 
-			for (idx[0] = 0; idx[0] < cnt[0]; idx[0]++) {
+			for (idx = 0; idx < cnt; idx++) {
 				if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
 					len = tvb_get_ntohl(tvb, offset);
 					offset += 4;
@@ -598,9 +621,12 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 				if (len) /* null-pointer check */
 					continue;
 
-				sane_sub_item[0] = proto_tree_add_item(sane_tree, hf_sane_net_option, tvb, offset, -1, ENC_BIG_ENDIAN);
+				if (!check_remaining_length(pinfo, remember_initial_offset, offset, length, 32))
+					return offset;
+
+				sane_sub_item = proto_tree_add_item(sane_tree, hf_sane_net_option, tvb, offset, -1, ENC_NA);
 				if (sane_sub_item) {
-					sane_sub_tree[0] = proto_item_add_subtree(sane_sub_item[0], ett_sane);
+					sane_sub_tree = proto_item_add_subtree(sane_sub_item, ett_sane);
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 32)) {
 						len = tvb_get_ntohl(tvb, offset);
@@ -609,7 +635,7 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_name, tvb, offset, len, ENC_UTF_8);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_name, tvb, offset, len, ENC_UTF_8);
 						offset += len;
 					} else
 						return offset;
@@ -621,7 +647,7 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_title, tvb, offset, len, ENC_UTF_8);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_title, tvb, offset, len, ENC_UTF_8);
 						offset += len;
 					} else
 						return offset;
@@ -633,38 +659,38 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_desc, tvb, offset, len, ENC_UTF_8);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_desc, tvb, offset, len, ENC_UTF_8);
 						offset += len;
 					} else
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 20)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_type, tvb, offset, 4, ENC_BIG_ENDIAN);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_type, tvb, offset, 4, ENC_BIG_ENDIAN);
 						offset += 4;
 					} else
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 16)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_unit, tvb, offset, 4, ENC_BIG_ENDIAN);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_unit, tvb, offset, 4, ENC_BIG_ENDIAN);
 						offset += 4;
 					} else
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 12)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_size, tvb, offset, 4, ENC_BIG_ENDIAN);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_size, tvb, offset, 4, ENC_BIG_ENDIAN);
 						offset += 4;
 					} else
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 8)) {
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_cap, tvb, offset, 4, ENC_BIG_ENDIAN);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_cap, tvb, offset, 4, ENC_BIG_ENDIAN);
 						offset += 4;
 					} else
 						return offset;
 
 					if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
 						len = tvb_get_ntohl(tvb, offset);
-						proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_constraint_type, tvb, offset, 4, ENC_BIG_ENDIAN);
+						proto_tree_add_item(sane_sub_tree, hf_sane_net_option_constraint_type, tvb, offset, 4, ENC_BIG_ENDIAN);
 						offset += 4;
 					} else
 						return offset;
@@ -687,59 +713,56 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 							if (!check_remaining_length(pinfo, remember_initial_offset, offset, length, 4 * 3))
 								return offset;
 
-							sane_sub_item[1] = proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_constraint_range, tvb, offset, 4 * 3, ENC_BIG_ENDIAN);
+							sane_subsub_item = proto_tree_add_item(sane_sub_tree, hf_sane_net_option_constraint_range, tvb, offset, 4 * 3, ENC_NA);
 							if (sane_sub_item) {
-								sane_sub_tree[1] = proto_item_add_subtree(sane_sub_item[1], ett_sane);
+								sane_subsub_tree = proto_item_add_subtree(sane_subsub_item, ett_sane);
 
-								proto_tree_add_item(sane_sub_tree[1], hf_sane_net_option_constraint_range_min, tvb, offset, 4, ENC_BIG_ENDIAN);
+								proto_tree_add_item(sane_subsub_tree, hf_sane_net_option_constraint_range_min, tvb, offset, 4, ENC_BIG_ENDIAN);
 								offset += 4;
 
-								proto_tree_add_item(sane_sub_tree[1], hf_sane_net_option_constraint_range_max, tvb, offset, 4, ENC_BIG_ENDIAN);
+								proto_tree_add_item(sane_subsub_tree, hf_sane_net_option_constraint_range_max, tvb, offset, 4, ENC_BIG_ENDIAN);
 								offset += 4;
 
-								proto_tree_add_item(sane_sub_tree[1], hf_sane_net_option_constraint_range_quant, tvb, offset, 4, ENC_BIG_ENDIAN);
+								proto_tree_add_item(sane_subsub_tree, hf_sane_net_option_constraint_range_quant, tvb, offset, 4, ENC_BIG_ENDIAN);
 								offset += 4;
 
-								proto_item_set_end(sane_sub_item[1], tvb, offset);
+								proto_item_set_end(sane_subsub_item, tvb, offset);
 							}
 						break;
 
 						case SANE_CONSTRAINT_WORD_LIST:
 							if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
-								cnt[1] = tvb_get_ntohl(tvb, offset);
-								sane_sub_item[1] = proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_constraint_word_list, tvb, offset, 4, ENC_BIG_ENDIAN);
+								sub_cnt = tvb_get_ntohl(tvb, offset);
+								sane_subsub_item = proto_tree_add_item(sane_sub_tree, hf_sane_net_option_constraint_word_list, tvb, offset, 4, ENC_BIG_ENDIAN);
 								offset += 4;
 							} else
 								return offset;
 
-							if (!check_remaining_length(pinfo, remember_initial_offset, offset, length, 4 * cnt[1]))
-								return offset;
+							if (sane_subsub_item) {
+								sane_subsub_tree = proto_item_add_subtree(sane_subsub_item, ett_sane);
 
-							if (sane_sub_item[1]) {
-								sane_sub_tree[1] = proto_item_add_subtree(sane_sub_item[1], ett_sane);
-
-								for (idx[1] = 0; idx[1] < cnt[1]; idx[1]++) {
-									proto_tree_add_item(sane_sub_tree[1], hf_sane_net_option_constraint_word_list_item, tvb, offset, 4, ENC_BIG_ENDIAN);
-									offset += 4;
+								for (sub_idx = 0; sub_idx < sub_cnt; sub_idx++) {
+									if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
+										proto_tree_add_item(sane_subsub_tree, hf_sane_net_option_constraint_word_list_item, tvb, offset, 4, ENC_BIG_ENDIAN);
+										offset += 4;
+									} else
+										return offset;
 								}
 							}
 						break;
 
 						case SANE_CONSTRAINT_STRING_LIST:
 							if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
-								cnt[1] = tvb_get_ntohl(tvb, offset);
-								sane_sub_item[1] = proto_tree_add_item(sane_sub_tree[0], hf_sane_net_option_constraint_string_list, tvb, offset, 4, ENC_BIG_ENDIAN);
+								sub_cnt = tvb_get_ntohl(tvb, offset);
+								sane_subsub_item = proto_tree_add_item(sane_sub_tree, hf_sane_net_option_constraint_string_list, tvb, offset, 4, ENC_BIG_ENDIAN);
 								offset += 4;
 							} else
 								return offset;
 
-							if (!check_remaining_length(pinfo, remember_initial_offset, offset, length, 4 * cnt[1]))
-								return offset;
-
 							if (sane_sub_item) {
-								sane_sub_tree[1] = proto_item_add_subtree(sane_sub_item[1], ett_sane);
+								sane_subsub_tree = proto_item_add_subtree(sane_subsub_item, ett_sane);
 
-								for (idx[1] = 0; idx[1] < cnt[1]; idx[1]++) {
+								for (sub_idx = 0; sub_idx < sub_cnt; sub_idx++) {
 									if (check_remaining_length(pinfo, remember_initial_offset, offset, length, 4)) {
 										len = tvb_get_ntohl(tvb, offset);
 										offset += 4;
@@ -747,7 +770,7 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 										return offset;
 
 									if (check_remaining_length(pinfo, remember_initial_offset, offset, length, len)) {
-										proto_tree_add_item(sane_sub_tree[1], hf_sane_net_option_constraint_string_list_item, tvb, offset, len, ENC_UTF_8);
+										proto_tree_add_item(sane_subsub_tree, hf_sane_net_option_constraint_string_list_item, tvb, offset, len, ENC_UTF_8);
 										offset += len;
 									} else
 										return offset;
@@ -756,7 +779,7 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 						break;
 					}
 
-					proto_item_set_end(sane_sub_item[0], tvb, offset);
+					proto_item_set_end(sane_sub_item, tvb, offset);
 				}
 			}
 		break;
@@ -818,29 +841,29 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 			if (!check_remaining_length(pinfo, remember_initial_offset, offset, length, 4 * 6))
 				return offset;
 
-			sane_sub_item[0] = proto_tree_add_item(sane_tree, hf_sane_net_parameters, tvb, offset, 4 * 6, ENC_NA);
+			sane_sub_item = proto_tree_add_item(sane_tree, hf_sane_net_parameters, tvb, offset, 4 * 6, ENC_NA);
 			if (sane_sub_item) {
-				sane_sub_tree[0] = proto_item_add_subtree(sane_sub_item[0], ett_sane);
+				sane_sub_tree = proto_item_add_subtree(sane_sub_item, ett_sane);
 
-				proto_tree_add_item(sane_sub_tree[0], hf_sane_net_parameters_format, tvb, offset, 4, ENC_BIG_ENDIAN);
+				proto_tree_add_item(sane_sub_tree, hf_sane_net_parameters_format, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
 
-				proto_tree_add_item(sane_sub_tree[0], hf_sane_net_parameters_last_frame, tvb, offset, 4, ENC_BIG_ENDIAN);
+				proto_tree_add_item(sane_sub_tree, hf_sane_net_parameters_last_frame, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
 
-				proto_tree_add_item(sane_sub_tree[0], hf_sane_net_parameters_bytes_per_line, tvb, offset, 4, ENC_BIG_ENDIAN);
+				proto_tree_add_item(sane_sub_tree, hf_sane_net_parameters_bytes_per_line, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
 
-				proto_tree_add_item(sane_sub_tree[0], hf_sane_net_parameters_pixels_per_line, tvb, offset, 4, ENC_BIG_ENDIAN);
+				proto_tree_add_item(sane_sub_tree, hf_sane_net_parameters_pixels_per_line, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
 
-				proto_tree_add_item(sane_sub_tree[0], hf_sane_net_parameters_lines, tvb, offset, 4, ENC_BIG_ENDIAN);
+				proto_tree_add_item(sane_sub_tree, hf_sane_net_parameters_lines, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
 
-				proto_tree_add_item(sane_sub_tree[0], hf_sane_net_parameters_depth, tvb, offset, 4, ENC_BIG_ENDIAN);
+				proto_tree_add_item(sane_sub_tree, hf_sane_net_parameters_depth, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
 
-				proto_item_set_end(sane_sub_item[0], tvb, offset);
+				proto_item_set_end(sane_sub_item, tvb, offset);
 			}
 		break;
 
@@ -887,8 +910,15 @@ static guint dissect_sane_rpc_response(packet_info *pinfo, proto_tree *sane_tree
 		break;
 	}
 
-	if (prpc && rpc_queue) {
-		g_queue_pop_head(rpc_queue);
+	if (packet_rpc_queue) {
+		packet_rpc = (guint*) g_queue_pop_head(packet_rpc_queue);
+		if (packet_rpc) {
+			g_queue_push_tail(packet_rpc_queue, packet_rpc);
+		}
+	}
+
+	if (!pinfo->fd->flags.visited && frame_rpc_queue) {
+		frame_rpc = (guint*) g_queue_pop_head(frame_rpc_queue);
 	}
 
 	return offset;
