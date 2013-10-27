@@ -58,7 +58,7 @@
 #define SANE_STATUS_ACCESS_DENIED			11
 
 #define SANE_TYPE_BOOL						0
-#define	SANE_TYPE_INT						1
+#define SANE_TYPE_INT						1
 #define SANE_TYPE_FIXED						2
 #define SANE_TYPE_STRING					3
 #define SANE_TYPE_BUTTON					4
